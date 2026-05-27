@@ -22,7 +22,14 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Iterable
 
 import httpx
+import msgspec
 import websockets
+
+# msgspec decoder — ~10x faster than stdlib json.loads on the hot WS path.
+# We decode to plain dict (not typed Struct) because MetaScalp uses 16+
+# message types with optional fields; the dispatcher in main._on_ms_event
+# branches on Type anyway. The win is in the decode itself.
+_WS_DECODER = msgspec.json.Decoder()
 
 from .config import MetaScalpConfig
 from .logger import get_logger
@@ -511,7 +518,7 @@ class MetaScalpWS:
                 if self._stop.is_set():
                     return
                 try:
-                    msg = json.loads(raw)
+                    msg = _WS_DECODER.decode(raw)
                 except Exception:  # noqa: BLE001
                     continue
                 try:

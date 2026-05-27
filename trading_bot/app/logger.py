@@ -2,9 +2,15 @@
 
 Secrets are redacted: any key containing 'token', 'secret', 'api_key', 'u_id',
 'cookie', 'authorization' is replaced with '***'. Never log raw config values.
+
+CSV / JSON sinks dispatch writes to a background asyncio task. The hot path
+(signal evaluation, fill recording) does `queue.put_nowait` and returns
+immediately — no disk I/O blocks the event loop. A small bounded queue plus
+an overflow drop policy keeps memory predictable if the writer falls behind.
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import logging
@@ -96,20 +102,95 @@ def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:
     return structlog.get_logger(name) if name else structlog.get_logger()
 
 
-class CsvSink:
-    """Thread-safe append-only CSV writer with a fixed header."""
+_log = get_logger("logger")
+
+
+class _AsyncWriterMixin:
+    """Shared bounded-queue + background-task plumbing for the CSV/JSON sinks.
+
+    Each sink lazily binds to the running event loop on the first `write()`
+    call from inside the loop. If we're called from a thread without a loop
+    (rare — only direct invocations from non-async code), we fall back to a
+    synchronous write under the lock.
+
+    The 4096-slot queue plus drop-newest policy means that under sustained
+    write storms the hot path stays non-blocking, at the cost of dropping
+    a tail signal row. Trades and latency events are far less frequent so
+    they almost never see the overflow path.
+    """
+
+    _MAX_QUEUE = 4096
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[dict[str, Any]] | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._sync_lock = threading.Lock()
+        self._dropped = 0
+
+    def _ensure_writer(self) -> bool:
+        """Bind to the running loop if we're inside one; otherwise return False."""
+        if self._queue is not None and self._task is not None and not self._task.done():
+            return True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        # We're inside an event loop — lazy-bind the queue + writer task.
+        self._loop = loop
+        self._queue = asyncio.Queue(maxsize=self._MAX_QUEUE)
+        self._task = loop.create_task(self._writer_loop())
+        return True
+
+    async def _writer_loop(self) -> None:
+        assert self._queue is not None
+        while True:
+            row = await self._queue.get()
+            try:
+                # Disk I/O off the hot path. The lock here is only contended
+                # with the sync-fallback path; that path is rare.
+                with self._sync_lock:
+                    self._sync_write(row)
+            except Exception as e:  # noqa: BLE001
+                _log.warning("logger.async_write_failed",
+                             sink=type(self).__name__, err=str(e))
+            finally:
+                self._queue.task_done()
+
+    def _sync_write(self, row: dict[str, Any]) -> None:  # pragma: no cover
+        raise NotImplementedError
+
+    def write(self, row: dict[str, Any]) -> None:
+        if self._ensure_writer():
+            assert self._queue is not None
+            try:
+                self._queue.put_nowait(row)
+            except asyncio.QueueFull:
+                self._dropped += 1
+                if self._dropped % 100 == 1:
+                    _log.warning("logger.queue_full_drop",
+                                 sink=type(self).__name__,
+                                 dropped_total=self._dropped)
+            return
+        # No running loop (e.g., tests / startup-time write): sync fallback.
+        with self._sync_lock:
+            self._sync_write(row)
+
+
+class CsvSink(_AsyncWriterMixin):
+    """Append-only CSV writer with a fixed header. Writes happen off-loop."""
 
     def __init__(self, path: str | Path, header: Iterable[str]) -> None:
+        super().__init__()
         self.path = Path(path)
         self.header = list(header)
-        self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists() or self.path.stat().st_size == 0:
             with self.path.open("w", encoding="utf-8", newline="") as f:
                 csv.writer(f).writerow(self.header)
 
-    def write(self, row: dict[str, Any]) -> None:
-        with self._lock, self.path.open("a", encoding="utf-8", newline="") as f:
+    def _sync_write(self, row: dict[str, Any]) -> None:
+        with self.path.open("a", encoding="utf-8", newline="") as f:
             csv.writer(f).writerow([row.get(k, "") for k in self.header])
 
 
@@ -123,14 +204,14 @@ class SignalsLogger(CsvSink):
         super().__init__(path, _SIGNALS_HEADER)
 
 
-class LatencyLogger:
+class LatencyLogger(_AsyncWriterMixin):
     """One JSON object per line — easier to grep + parse than CSV here."""
 
     def __init__(self, path: str | Path) -> None:
+        super().__init__()
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
 
-    def write(self, payload: dict[str, Any]) -> None:
-        with self._lock, self.path.open("a", encoding="utf-8") as f:
+    def _sync_write(self, payload: dict[str, Any]) -> None:
+        with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, separators=(",", ":")) + "\n")

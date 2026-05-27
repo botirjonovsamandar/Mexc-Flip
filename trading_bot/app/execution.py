@@ -108,6 +108,13 @@ class TickerRules:
     size_increment: float | None = None
     min_size: float | None = None
     max_size: float | None = None
+    # Pre-computed once at ticker-rule load: avoids Decimal(str(...))
+    # conversion on every order roundtrip (~10-30us per call, x several
+    # per entry). On the hot path this savings is per-order, but adds up.
+    price_step_dec: Decimal | None = None
+    size_step_dec: Decimal | None = None
+    price_decimals: int = 0
+    size_decimals: int = 0
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "TickerRules":
@@ -122,11 +129,27 @@ class TickerRules:
                     return parsed if parsed > 0 else None
             return None
 
+        price_inc = _num("PriceIncrement", "priceIncrement")
+        size_inc = _num("SizeIncrement", "sizeIncrement")
+        price_dec_obj: Decimal | None = None
+        size_dec_obj: Decimal | None = None
+        price_decimals = 0
+        size_decimals = 0
+        if price_inc is not None and price_inc > 0:
+            price_dec_obj = Decimal(str(price_inc))
+            price_decimals = max(0, -price_dec_obj.normalize().as_tuple().exponent)
+        if size_inc is not None and size_inc > 0:
+            size_dec_obj = Decimal(str(size_inc))
+            size_decimals = max(0, -size_dec_obj.normalize().as_tuple().exponent)
         return cls(
-            price_increment=_num("PriceIncrement", "priceIncrement"),
-            size_increment=_num("SizeIncrement", "sizeIncrement"),
+            price_increment=price_inc,
+            size_increment=size_inc,
             min_size=_num("MinSize", "minSize"),
             max_size=_num("MaxSize", "maxSize"),
+            price_step_dec=price_dec_obj,
+            size_step_dec=size_dec_obj,
+            price_decimals=price_decimals,
+            size_decimals=size_decimals,
         )
 
 
@@ -160,6 +183,10 @@ class ExecutionEngine:
         # Map of ClientId/OrderId -> Future that _live_fill awaits.
         # Resolved by WS order_update events (see on_ws_order_update).
         self._pending_order_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        # Pre-armed per-symbol cache: (native_ticker, ticker_gate). Populated
+        # lazily on first use and refreshed when mexc_ticker_map is wired.
+        # Avoids re-running _validate_live_ticker on the entry hot path.
+        self._entry_template_cache: dict[str, tuple[str, TickerGate]] = {}
         self._account_snapshot: AccountSnapshot | None = None
         self._exchange_positions: list[dict[str, Any]] = []
         self._last_exchange_positions_refresh: float = 0.0
@@ -178,6 +205,26 @@ class ExecutionEngine:
     def _mexc_ticker(self, canonical: str) -> str:
         """Translate a canonical symbol to MEXC's native ticker; fall back to canonical."""
         return self.mexc_ticker_map.get(canonical.upper(), canonical)
+
+    def _entry_template(self, canonical: str) -> tuple[str, TickerGate]:
+        """Cached (native_ticker, ticker_gate) for a canonical symbol.
+
+        Avoids re-running ticker normalization + allowlist validation on the
+        order hot path. The cache is invalidated when mexc_ticker_map is
+        replaced (see invalidate_entry_templates).
+        """
+        canonical = canonical.upper()
+        cached = self._entry_template_cache.get(canonical)
+        if cached is not None:
+            return cached
+        native = self._mexc_ticker(canonical)
+        gate = self._validate_live_ticker(canonical, native)
+        self._entry_template_cache[canonical] = (native, gate)
+        return native, gate
+
+    def invalidate_entry_templates(self) -> None:
+        """Call when mexc_ticker_map changes (e.g., after reconnect)."""
+        self._entry_template_cache.clear()
 
     @property
     def allowed_symbols(self) -> set[str]:
@@ -993,8 +1040,8 @@ class ExecutionEngine:
                 symbol, side, (book.best_bid or mark) * (1 - limit_offset),
             )
 
-        mexc_ticker = self._mexc_ticker(symbol)
-        ticker_gate = self._validate_live_ticker(symbol, mexc_ticker)
+        # Pre-armed: native ticker + allowlist gate resolved once per symbol.
+        mexc_ticker, ticker_gate = self._entry_template(symbol)
         if not ticker_gate.allowed:
             log.error("execution.native_ticker_blocked",
                       symbol=symbol, native_ticker=mexc_ticker,
@@ -1354,10 +1401,15 @@ class ExecutionEngine:
                     and rules.min_size is not None:
                 qty = max(qty, rules.min_size)
             if rules.size_increment is not None:
-                if self.mode is TradingMode.SMALL_LIVE or target_notional_usdt is not None:
-                    qty = _round_up_to_step(qty, rules.size_increment)
+                rounding = (ROUND_CEILING
+                            if (self.mode is TradingMode.SMALL_LIVE
+                                or target_notional_usdt is not None)
+                            else ROUND_FLOOR)
+                if rules.size_step_dec is not None:
+                    qty = _round_to_step_cached(qty, rules.size_step_dec,
+                                                rules.size_decimals, rounding)
                 else:
-                    qty = _round_down_to_step(qty, rules.size_increment)
+                    qty = _round_to_step(qty, rules.size_increment, rounding)
             if rules.min_size is not None and qty < rules.min_size:
                 return 0.0, 0.0
             if rules.max_size is not None and qty > rules.max_size:
@@ -1368,9 +1420,11 @@ class ExecutionEngine:
         rules = self.mexc_ticker_rules.get(symbol.upper())
         if rules is None or rules.price_increment is None:
             return price
-        if side is Side.LONG:
-            return _round_up_to_step(price, rules.price_increment)
-        return _round_down_to_step(price, rules.price_increment)
+        rounding = ROUND_CEILING if side is Side.LONG else ROUND_FLOOR
+        if rules.price_step_dec is not None:
+            return _round_to_step_cached(price, rules.price_step_dec,
+                                          rules.price_decimals, rounding)
+        return _round_to_step(price, rules.price_increment, rounding)
 
     def _entry_price(self, side: Side, book: Book) -> float | None:
         return book.best_ask if side is Side.LONG else book.best_bid
@@ -1385,7 +1439,9 @@ class ExecutionEngine:
         return entry_price * (1 + sl_mult)
 
     def _estimate_slippage_bps(self, book: Book, side: Side, qty: float) -> float:
-        levels = book.asks if side is Side.LONG else book.bids
+        # asks_list() ascending (cheapest first), bids_list() descending
+        # (highest first) — both match "best price first" for the buy/sell side.
+        levels = book.asks_list() if side is Side.LONG else book.bids_list()
         if not levels:
             return 1e9
         mid = book.mid or levels[0][0]
@@ -1408,12 +1464,12 @@ class ExecutionEngine:
                         notional_usdt: float) -> TickerGate:
         if qty <= 0 or notional_usdt <= 0:
             return TickerGate(False, "empty_order")
-        levels = book.asks if side is Side.LONG else book.bids
+        levels = book.asks_list(5) if side is Side.LONG else book.bids_list(5)
         if not levels:
             return TickerGate(False, "empty_entry_side_book")
         best_notional = max(0.0, levels[0][0] * levels[0][1])
         side_depth = sum(max(0.0, price * level_qty)
-                         for price, level_qty in levels[:5])
+                         for price, level_qty in levels)
         best_ratio = best_notional / notional_usdt
         side_ratio = side_depth / notional_usdt
         if best_ratio < self.exec_cfg.min_best_level_to_notional:
@@ -1514,6 +1570,16 @@ def _round_to_step(value: float, step: float, rounding: str) -> float:
     units = (value_dec / step_dec).to_integral_value(rounding=rounding)
     rounded = units * step_dec
     decimals = max(0, -step_dec.normalize().as_tuple().exponent)
+    return round(float(rounded), decimals)
+
+
+def _round_to_step_cached(value: float, step_dec: Decimal,
+                          decimals: int, rounding: str) -> float:
+    """Same rounding as _round_to_step, but reuses the pre-built Decimal step
+    and decimals count (computed once in TickerRules.from_raw)."""
+    value_dec = Decimal(str(value))
+    units = (value_dec / step_dec).to_integral_value(rounding=rounding)
+    rounded = units * step_dec
     return round(float(rounded), decimals)
 
 

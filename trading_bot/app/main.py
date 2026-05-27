@@ -193,6 +193,7 @@ class TradingBot:
         self.execution.metascalp = client
         self.execution.mexc_connection_id = self.mexc_conn.id
         self.execution.mexc_ticker_map = self.mexc_tickers
+        self.execution.invalidate_entry_templates()
         self.execution.mexc_ticker_rules = await _build_ticker_rules(
             client, self.mexc_conn.id, self.mexc_tickers,
         )
