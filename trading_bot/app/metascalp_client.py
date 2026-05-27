@@ -178,9 +178,16 @@ class MetaScalpClient:
                     f"{self.cfg.port_scan_start}-{self.cfg.port_scan_end}. "
                     "Is MetaScalp running?"
                 )
+        # Explicit pool config so a stray reconnect can't blip the order path.
+        limits = httpx.Limits(
+            max_keepalive_connections=20,
+            max_connections=20,
+            keepalive_expiry=300.0,
+        )
         self._client = httpx.AsyncClient(
             base_url=f"http://{self.cfg.host}:{self._port}",
             timeout=self.cfg.request_timeout_sec,
+            limits=limits,
         )
         # Cache app metadata from /ping for the dashboard.
         try:
@@ -421,6 +428,9 @@ class OrderbookSubscription:
     depth_levels: int = 50
     fetch_snapshot: bool = True
     zoom_index: int = 0
+    # >0 enables MetaScalp's server-side band-pass filter around best bid/ask.
+    # Applies to both snapshot and updates. Cuts payload massively.
+    depth_percent: float = 0.0
 
 
 class MetaScalpWS:
@@ -455,11 +465,12 @@ class MetaScalpWS:
 
     def add_orderbook(self, connection_id: int, ticker: str, *,
                       depth_levels: int = 50, zoom_index: int = 0,
-                      fetch_snapshot: bool = True) -> None:
+                      fetch_snapshot: bool = True,
+                      depth_percent: float = 0.0) -> None:
         self._orderbook_subs.append(OrderbookSubscription(
             connection_id=connection_id, ticker=ticker,
             depth_levels=depth_levels, fetch_snapshot=fetch_snapshot,
-            zoom_index=zoom_index,
+            zoom_index=zoom_index, depth_percent=depth_percent,
         ))
 
     def add_trade(self, connection_id: int, ticker: str, zoom_index: int = 1) -> None:
@@ -514,13 +525,17 @@ class MetaScalpWS:
             await ws.send(json.dumps({"Type": "subscribe",
                                        "Data": {"ConnectionId": cid}}))
         for s in self._orderbook_subs:
-            await ws.send(json.dumps({"Type": "orderbook_subscribe", "Data": {
+            payload: dict[str, Any] = {
                 "ConnectionId": s.connection_id,
                 "Ticker": s.ticker,
                 "ZoomIndex": s.zoom_index,
                 "DepthLevels": s.depth_levels,
                 "FetchSnapshot": s.fetch_snapshot,
-            }}))
+            }
+            if s.depth_percent and s.depth_percent > 0:
+                payload["DepthPercent"] = s.depth_percent
+            await ws.send(json.dumps({"Type": "orderbook_subscribe",
+                                       "Data": payload}))
         for cid, ticker in self._trade_subs:
             await ws.send(json.dumps({"Type": "trade_subscribe", "Data": {
                 "ConnectionId": cid, "Ticker": ticker, "ZoomIndex": 1,

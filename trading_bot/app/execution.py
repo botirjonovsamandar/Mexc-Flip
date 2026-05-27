@@ -157,6 +157,9 @@ class ExecutionEngine:
         self.mexc_ticker_map: dict[str, str] = mexc_ticker_map or {}
         self.mexc_ticker_rules: dict[str, TickerRules] = mexc_ticker_rules or {}
         self._pending_entries: dict[str, float] = {}
+        # Map of ClientId/OrderId -> Future that _live_fill awaits.
+        # Resolved by WS order_update events (see on_ws_order_update).
+        self._pending_order_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._account_snapshot: AccountSnapshot | None = None
         self._exchange_positions: list[dict[str, Any]] = []
         self._last_exchange_positions_refresh: float = 0.0
@@ -215,6 +218,41 @@ class ExecutionEngine:
     def recent_trades_snapshot(self) -> list[dict[str, Any]]:
         return list(self._recent_trades)
 
+    # ---- WS event hooks (called from main on_ms_event) ---------------------
+
+    def invalidate_account_snapshot(self) -> None:
+        """Force the next account_snapshot() call to bypass the cache.
+
+        Called when MetaScalp WS pushes a balance_update — our cached number
+        is stale by definition until we re-fetch.
+        """
+        self._account_snapshot = None
+
+    def on_ws_order_update(self, data: dict[str, Any]) -> None:
+        """Hook for WS-delivered order_update events.
+
+        Resolves any pending entry future keyed by ClientId/OrderId so
+        _await_fill can complete without REST polling. Polling fallback
+        in _await_fill still runs in case WS misses an event.
+        """
+        client_id = str(data.get("ClientId") or data.get("clientId") or "")
+        order_id = str(data.get("OrderId") or data.get("orderId") or "")
+        fut = None
+        if client_id and client_id in self._pending_order_futures:
+            fut = self._pending_order_futures.get(client_id)
+        elif order_id and order_id in self._pending_order_futures:
+            fut = self._pending_order_futures.get(order_id)
+        if fut is None or fut.done():
+            return
+        status = str(data.get("Status") or data.get("status") or "").lower()
+        terminal_states = ("closed", "filled", "cancelled", "canceled",
+                           "rejected", "expired")
+        if status in terminal_states:
+            try:
+                fut.set_result(dict(data))
+            except asyncio.InvalidStateError:
+                pass
+
     # ---- public entrypoints -------------------------------------------------
 
     async def build_entry_plans(self, signals: list[SignalResult]) -> list[EntryPlan]:
@@ -230,7 +268,12 @@ class ExecutionEngine:
                         remaining_sec=round(latency_wait, 1))
             return []
 
-        await self.refresh_exchange_positions(force=True)
+        # WS position_update events force-refresh the cache (see
+        # main._on_ms_event). The non-force call here is a no-op when the
+        # cache is fresh (TTL = dashboard.exchange_refresh_sec, 30s) but
+        # still seeds it on cold start. The forced REST roundtrip that
+        # used to sit on this hot path is gone — it added ~80ms per signal.
+        await self.refresh_exchange_positions()
         occupied_symbols = self.occupied_symbols
         signals = [
             s for s in signals
@@ -1046,9 +1089,28 @@ class ExecutionEngine:
 
         order_id = str(resp.get("OrderId") or resp.get("ClientId")
                         or resp.get("orderId") or resp.get("clientId") or "")
-        fill_price, filled_qty, filled = await self._await_fill(
-            order_id, mexc_ticker, timeout_ms=self.exec_cfg.fill_timeout_ms,
-        )
+        client_id = str(resp.get("ClientId") or resp.get("clientId") or "")
+
+        # Register a Future under BOTH ids (whichever the WS event references).
+        # The on_ws_order_update hook resolves the Future as soon as MetaScalp
+        # pushes a terminal status — eliminating the 150ms polling cadence.
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future[dict[str, Any]] = loop.create_future()
+        future_keys: list[str] = []
+        for key in (client_id, order_id):
+            if key and key not in self._pending_order_futures:
+                self._pending_order_futures[key] = fut
+                future_keys.append(key)
+
+        try:
+            fill_price, filled_qty, filled = await self._await_fill(
+                order_id, mexc_ticker,
+                timeout_ms=self.exec_cfg.fill_timeout_ms,
+                ws_future=fut,
+            )
+        finally:
+            for key in future_keys:
+                self._pending_order_futures.pop(key, None)
         fill_ms = (time.monotonic() - t_send) * 1000 - send_ms
 
         if not filled or fill_price is None:
@@ -1189,47 +1251,90 @@ class ExecutionEngine:
                  stop_price=pos.stop_price, order_id=pos.stop_order_id)
         return True
 
-    async def _await_fill(self, order_id: str, ticker: str, *, timeout_ms: int
+    async def _await_fill(self, order_id: str, ticker: str, *, timeout_ms: int,
+                          ws_future: asyncio.Future[dict[str, Any]] | None = None,
                           ) -> tuple[float | None, float, bool]:
-        """Poll get_orders until the order is filled or timeout.
+        """Wait for an order's terminal state.
 
-        Polling cadence is 150ms (~6.7 polls/sec) — well under MEXC's 10/sec
-        ceiling even when we have parallel orders in flight.
+        Primary path: a Future resolved by `on_ws_order_update` when MetaScalp
+        pushes the order_update WS event (typically 10-50ms after the fill).
+
+        Fallback path: poll get_orders every 500ms — catches the rare case where
+        the WS event was missed (disconnect, parse error). 500ms is 3x the old
+        150ms cadence which was on the hot path; now polling is only a safety
+        net so it can be much slower.
         """
         assert self.metascalp is not None
         assert self.mexc_connection_id is not None
         deadline = time.monotonic() + timeout_ms / 1000.0
         last_filled_qty = 0.0
         last_price: float | None = None
-        poll_interval = 0.15
+        poll_interval = 0.5  # was 0.15 — WS-driven now, poll is fallback only
+
+        def _parse_ws_payload(data: dict[str, Any]) -> tuple[float | None, float, str]:
+            status = str(data.get("Status") or data.get("status") or "").lower()
+            fq = (data.get("FilledSize") or data.get("filledSize")
+                  or data.get("FilledQty") or 0.0)
+            fp = (data.get("FilledPrice") or data.get("filledPrice")
+                  or data.get("AvgPrice") or data.get("Price") or data.get("price"))
+            qty = float(fq) if fq else 0.0
+            price = float(fp) if fp is not None else None
+            return price, qty, status
+
         while time.monotonic() < deadline:
-            # get_orders polls reach MEXC through MetaScalp; account for it.
-            if not self.rate_limiter.acquire("entry"):
-                await asyncio.sleep(poll_interval)
-                continue
-            try:
-                orders = await self.metascalp.get_orders(self.mexc_connection_id,
-                                                         ticker=ticker)
-            except Exception:  # noqa: BLE001
-                await asyncio.sleep(poll_interval)
-                continue
-            for o in orders:
-                oid = str(o.get("OrderId") or o.get("ClientId")
-                           or o.get("orderId") or o.get("clientId") or "")
-                if order_id and oid != order_id:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            # First: race the WS future against a poll interval.
+            if ws_future is not None and not ws_future.done():
+                try:
+                    payload = await asyncio.wait_for(
+                        asyncio.shield(ws_future),
+                        timeout=min(poll_interval, remaining),
+                    )
+                except asyncio.TimeoutError:
+                    payload = None
+                else:
+                    price, qty, status = _parse_ws_payload(payload)
+                    if price is not None:
+                        last_price = price
+                    if qty > 0:
+                        last_filled_qty = qty
+                    if status in ("closed", "filled", "done"):
+                        return last_price, last_filled_qty, True
+                    if status in ("cancelled", "canceled", "rejected", "expired"):
+                        return last_price, last_filled_qty, last_filled_qty > 0
+
+            # Fallback poll. Only acquires budget if WS path didn't resolve.
+            if ws_future is None or not ws_future.done():
+                if not self.rate_limiter.acquire("entry"):
+                    await asyncio.sleep(poll_interval)
                     continue
-                status = str(o.get("Status") or o.get("status") or "").upper()
-                fq = o.get("FilledSize") or o.get("filledSize") or o.get("FilledQty") or 0.0
-                last_filled_qty = float(fq)
-                fp = (o.get("FilledPrice") or o.get("filledPrice")
-                       or o.get("AvgPrice") or o.get("Price") or o.get("price"))
-                if fp is not None:
-                    last_price = float(fp)
-                if status in ("FILLED", "CLOSED", "DONE"):
-                    return last_price, last_filled_qty, True
-                if status in ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED"):
-                    return last_price, last_filled_qty, last_filled_qty > 0
-            await asyncio.sleep(poll_interval)
+                try:
+                    orders = await self.metascalp.get_orders(
+                        self.mexc_connection_id, ticker=ticker,
+                    )
+                except Exception:  # noqa: BLE001
+                    await asyncio.sleep(poll_interval)
+                    continue
+                for o in orders:
+                    oid = str(o.get("OrderId") or o.get("ClientId")
+                              or o.get("orderId") or o.get("clientId") or "")
+                    if order_id and oid != order_id:
+                        continue
+                    status = str(o.get("Status") or o.get("status") or "").upper()
+                    fq = (o.get("FilledSize") or o.get("filledSize")
+                          or o.get("FilledQty") or 0.0)
+                    last_filled_qty = float(fq) if fq else last_filled_qty
+                    fp = (o.get("FilledPrice") or o.get("filledPrice")
+                          or o.get("AvgPrice") or o.get("Price") or o.get("price"))
+                    if fp is not None:
+                        last_price = float(fp)
+                    if status in ("FILLED", "CLOSED", "DONE"):
+                        return last_price, last_filled_qty, True
+                    if status in ("CANCELLED", "CANCELED", "REJECTED", "EXPIRED"):
+                        return last_price, last_filled_qty, last_filled_qty > 0
         return last_price, last_filled_qty, last_filled_qty > 0
 
     # ---- helpers ------------------------------------------------------------

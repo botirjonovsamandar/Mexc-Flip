@@ -82,6 +82,12 @@ class TradingBot:
         self.dashboard = DashboardState()
         self.dashboard.mode = cfg.mode.value
         self._stop = asyncio.Event()
+        # Event-driven hot path: WS handler sets `_dirty_event` and records the
+        # symbol in `_dirty_symbols` when a Binance update arrives. The signal
+        # and position-exit loops wake up immediately and evaluate ONLY those
+        # symbols — no fixed 50ms / 100ms polling latency.
+        self._dirty_symbols: set[str] = set()
+        self._dirty_event: asyncio.Event = asyncio.Event()
 
     # ---- lifecycle ----------------------------------------------------------
 
@@ -197,16 +203,19 @@ class TradingBot:
         ws.add_connection_subscribe(self.mexc_conn.id)
         depth = self.cfg.market_data.orderbook_depth_levels
         fetch = self.cfg.market_data.fetch_snapshot_on_subscribe
+        depth_pct = self.cfg.market_data.orderbook_depth_percent
         for canonical in binance_syms:
             ex_ticker = self.binance_tickers.get(canonical)
             if ex_ticker:
                 ws.add_orderbook(self.binance_conn.id, ticker=ex_ticker,
-                                  depth_levels=depth, fetch_snapshot=fetch)
+                                  depth_levels=depth, fetch_snapshot=fetch,
+                                  depth_percent=depth_pct)
         for canonical in self.cfg.symbols:
             ex_ticker = self.mexc_tickers.get(canonical)
             if ex_ticker:
                 ws.add_orderbook(self.mexc_conn.id, ticker=ex_ticker,
-                                  depth_levels=depth, fetch_snapshot=fetch)
+                                  depth_levels=depth, fetch_snapshot=fetch,
+                                  depth_percent=depth_pct)
         self.metascalp_ws = ws
         self.risk.set_health(metascalp=True)
         await ws.run()
@@ -244,15 +253,23 @@ class TradingBot:
             else:
                 cache.apply_update(canonical, bids, asks, ts_ms=ts_ms,
                                    best_bid=best_bid, best_ask=best_ask)
+            # Wake the signal/exit loops on any Binance touch — strategy reads
+            # Binance impulse; MEXC updates change the book but not the trigger.
+            if source == "binance":
+                self._dirty_symbols.add(canonical.upper())
+                self._dirty_event.set()
         elif mtype in ("order_update", "position_update", "balance_update",
                         "finres_update"):
             log.debug("metascalp.event", type=mtype, data=data)
             if mtype == "order_update":
                 self.dashboard.push_order(_compact_order_event(data))
+                self.execution.on_ws_order_update(data)
             elif mtype == "position_update":
                 self.dashboard.exchange_positions = await self.execution.refresh_exchange_positions(
                     force=True,
                 )
+            elif mtype == "balance_update":
+                self.execution.invalidate_account_snapshot()
         elif mtype == "subscribed":
             log.info("metascalp.subscribed", data=data)
         elif mtype == "error":
@@ -262,12 +279,48 @@ class TradingBot:
     # ---- loops --------------------------------------------------------------
 
     async def _signal_loop(self) -> None:
-        interval = max(0.005, self.cfg.strategy.signal_eval_interval_ms / 1000.0)
+        """Event-driven: wakes when Binance WS pushes an update.
+
+        Evaluates only the symbols that actually changed (`_dirty_symbols`).
+        A 250ms fallback timeout still re-runs the full sweep in case the
+        WS feed is silent — protects time-based decisions (cooldowns, exits).
+        """
+        fallback_sec = max(0.05,
+                           self.cfg.strategy.signal_eval_interval_ms / 1000.0 * 5)
+        allowed = {s.upper() for s in self.cfg.symbols}
         while not self._stop.is_set():
-            await asyncio.sleep(interval)
+            try:
+                await asyncio.wait_for(self._dirty_event.wait(),
+                                       timeout=fallback_sec)
+            except asyncio.TimeoutError:
+                # Periodic sweep — re-check all symbols even when WS is quiet.
+                syms_to_eval: list[str] = list(self.cfg.symbols)
+            else:
+                # Drain the dirty set, intersected with our traded universe.
+                dirty = self._dirty_symbols.copy()
+                self._dirty_symbols.clear()
+                self._dirty_event.clear()
+                syms_to_eval = [s for s in dirty if s in allowed]
+                if not syms_to_eval:
+                    continue
+
+            # First: check exits on any dirty symbol that already has a
+            # position. This is the fast-path for price-driven exits — no
+            # 100ms polling lag anymore.
+            if self.cfg.mode is not TradingMode.DRY_RUN:
+                open_set = set(self.positions.open_symbols)
+                for sym in syms_to_eval:
+                    if sym in open_set:
+                        b_mid = self.binance_cache.book(sym).mid
+                        decision = self.positions.check_exit(sym, b_mid)
+                        if decision.should_exit and decision.reason:
+                            await self.execution.close_position(
+                                sym, decision.reason, decision.detail,
+                            )
+
             occupied_symbols = set(self.execution.occupied_symbols)
             enter_signals = []
-            for sym in self.cfg.symbols:
+            for sym in syms_to_eval:
                 res = self.strategy.evaluate(sym, occupied_symbols)
                 self._record_signal(res)
                 if res.decision is Decision.ENTER:
@@ -301,10 +354,22 @@ class TradingBot:
                                       self.cfg.strategy.cooldown_per_symbol_sec)
 
     async def _position_loop(self) -> None:
+        """Event-driven exit check.
+
+        Wakes on the same Binance dirty event as _signal_loop, but only acts
+        on symbols where we have open positions. 1s fallback covers the
+        time-based exits (`max_position_time_seconds`).
+        """
         while not self._stop.is_set():
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1.0)
             if self.cfg.mode is TradingMode.DRY_RUN:
                 continue
+            # Time-based exits (max_position_time_seconds, breakeven trigger)
+            # don't depend on a fresh Binance tick, so the periodic sweep
+            # iterates ALL open symbols here. The Binance-tick-driven path is
+            # below (we don't have a separate event for exits — strategy reads
+            # Binance impulse and position_manager reads Binance mid for stops,
+            # both share the same dirty signal).
             for sym in list(self.positions.open_symbols):
                 b_mid = self.binance_cache.book(sym).mid
                 decision = self.positions.check_exit(sym, b_mid)

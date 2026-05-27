@@ -26,7 +26,8 @@
   },
 
   "market_data": {
-    "orderbook_depth_levels": 50,
+    "orderbook_depth_levels": 10,
+    "orderbook_depth_percent": 0.5,
     "fetch_snapshot_on_subscribe": true,
     "max_staleness_ms": 2000,
     "mid_history_seconds": 5.0
@@ -71,8 +72,8 @@
     "basis_collapse_exit_bps": 1.0,
     "emergency_kill_switch": false,
     "pause_after_consecutive_losses_sec": 900,
-    "max_mexc_requests_per_sec": 6,
-    "max_mexc_requests_per_min": 180
+    "max_mexc_requests_per_sec": 15,
+    "max_mexc_requests_per_min": 400
   },
 
   "capital": {
@@ -85,7 +86,7 @@
     "balance_reserve_pct": 0.10,
     "min_balance_reserve_usdt": 1.0,
     "paper_balance_usdt": 25.0,
-    "balance_refresh_sec": 1.0,
+    "balance_refresh_sec": 30.0,
     "estimated_fee_bps": 0.0,
     "min_net_edge_bps": 4.0,
     "min_expected_profit_usdt": 0.02,
@@ -100,7 +101,7 @@
   },
 
   "rate_limits": {
-    "upstream_hourly_limit": 500,
+    "upstream_hourly_limit": 5000,
     "safety_factor": 0.88,
     "close_reserve_pct": 0.10,
     "min_close_reserve_requests": 10,

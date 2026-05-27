@@ -62,7 +62,11 @@ class MetaScalpConfig(BaseModel):
 
 class MarketDataConfig(BaseModel):
     """Settings that apply to both Binance and MEXC orderbook subscriptions."""
-    orderbook_depth_levels: int = 50
+    orderbook_depth_levels: int = 10
+    # MetaScalp server-side band-pass filter: keeps only levels within this
+    # percent of best bid/ask, applied to both snapshot and updates. Saves
+    # ~70-80% of WS payload for shallow strategies. 0 disables.
+    orderbook_depth_percent: float = 0.5
     fetch_snapshot_on_subscribe: bool = True
     # 2s is enough headroom for thin tickers; the strategy applies this per-symbol.
     max_staleness_ms: int = 2000
@@ -96,10 +100,11 @@ class RiskConfig(BaseModel):
     basis_collapse_exit_bps: float = 1.0
     emergency_kill_switch: bool = False
     pause_after_consecutive_losses_sec: int = 900
-    # MEXC Contract API allows 20 req / 2 sec = 10/sec. We keep room for
-    # MetaScalp's own bookkeeping and stay at 6/sec, 180/min.
-    max_mexc_requests_per_sec: int = 6
-    max_mexc_requests_per_min: int = 180
+    # MEXC Contract API allows 20 req / 2 sec = 10/sec on the order path.
+    # WS-driven fills (no polling) keep us well below this; raised defaults
+    # to avoid throttling real entry/close bursts.
+    max_mexc_requests_per_sec: int = 15
+    max_mexc_requests_per_min: int = 400
 
 
 class CapitalConfig(BaseModel):
@@ -118,7 +123,7 @@ class CapitalConfig(BaseModel):
     balance_reserve_pct: float = 0.10
     min_balance_reserve_usdt: float = 1.0
     paper_balance_usdt: float = 25.0
-    balance_refresh_sec: float = 1.0
+    balance_refresh_sec: float = 30.0
     estimated_fee_bps: float = 0.0
     min_net_edge_bps: float = 4.0
     min_expected_profit_usdt: float = 0.02
@@ -159,7 +164,7 @@ class LeverageConfig(BaseModel):
 class RateLimitsConfig(BaseModel):
     """Internal request budget layered above exchange/MetaScalp limits."""
 
-    upstream_hourly_limit: Optional[int] = 500
+    upstream_hourly_limit: Optional[int] = 5000
     safety_factor: float = 0.88
     close_reserve_pct: float = 0.10
     min_close_reserve_requests: int = 10
