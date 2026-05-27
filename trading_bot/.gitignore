@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local config and secrets — NEVER commit
+configs/config.json
+configs/config.local.json
+.env
+*.key
+*.pem
+
+# Runtime data
+data/logs/*.log
+data/logs/*.jsonl
+data/trades/*.csv
+data/trades/*.json
+data/*.sqlite
+data/*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store

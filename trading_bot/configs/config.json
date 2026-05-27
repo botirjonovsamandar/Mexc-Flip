@@ -1,0 +1,149 @@
+{
+  "mode": "SMALL_LIVE",
+  "_mode_comment": "DRY_RUN | PAPER | SMALL_LIVE | LIVE — never start at LIVE",
+
+  "metascalp": {
+    "host": "127.0.0.1",
+    "port_scan_start": 17845,
+    "port_scan_end": 17855,
+    "port_override": null,
+    "request_timeout_sec": 3.0,
+    "ws_reconnect_delay_sec": 1.0,
+    "ws_max_reconnect_delay_sec": 30.0,
+    "_connection_hint_doc": "connection_id wins if set. Otherwise we match by exchange (substring, case-insensitive) and market_types. MarketType values seen in the wild: 1=Futures (generic), 2=UsdtFutures, 5=UsdtPerpetual.",
+    "binance_connection": {
+      "connection_id": 2,
+      "exchange": "Binance",
+      "market_types": [5, 2, 1],
+      "require_can_trade": false
+    },
+    "mexc_connection": {
+      "connection_id": 5,
+      "exchange": "MEXC",
+      "market_types": [5, 2, 1],
+      "require_can_trade": true
+    }
+  },
+
+  "market_data": {
+    "orderbook_depth_levels": 50,
+    "fetch_snapshot_on_subscribe": true,
+    "max_staleness_ms": 2000,
+    "mid_history_seconds": 5.0
+  },
+
+  "symbols": [
+    "XLMUSDT",
+    "PENGUUSDT",
+    "ASTERUSDT",
+    "ZECUSDT",
+    "XMRUSDT",
+    "BCHUSDT",
+    "HYPEUSDT",
+    "DOGEUSDT",
+    "LINKUSDT"
+  ],
+
+  "strategy": {
+    "impulse_window_ms": 500,
+    "min_binance_impulse_bps": 7.0,
+    "min_basis_lag_bps": 8.0,
+    "max_mexc_spread_bps": 4.0,
+    "min_depth_usdt": 5000.0,
+    "btc_eth_filter_enabled": true,
+    "btc_eth_filter_threshold_bps": 4.0,
+    "cooldown_per_symbol_sec": 30.0,
+    "signal_eval_interval_ms": 50
+  },
+
+  "risk": {
+    "max_position_usdt": 50.0,
+    "max_daily_loss_usdt": 25.0,
+    "max_trades_per_day": 40,
+    "max_consecutive_losses": 3,
+    "max_open_positions": 2,
+    "stop_loss_percent": 1.0,
+    "take_profit_bps": 8.0,
+    "breakeven_trigger_bps": 4.0,
+    "max_slippage_bps": 3.0,
+    "max_spread_bps": 5.0,
+    "max_position_time_seconds": 60,
+    "basis_collapse_exit_bps": 1.0,
+    "emergency_kill_switch": false,
+    "pause_after_consecutive_losses_sec": 900,
+    "max_mexc_requests_per_sec": 6,
+    "max_mexc_requests_per_min": 180
+  },
+
+  "capital": {
+    "two_trade_min_balance_usdt": 31.0,
+    "low_balance_max_positions": 1,
+    "high_balance_max_positions": 2,
+    "configured_max_positions": 2,
+    "low_balance_margin_pct_range": [0.75, 0.80],
+    "high_balance_top_signal_margin_pct_range": [0.50, 0.60],
+    "balance_reserve_pct": 0.10,
+    "min_balance_reserve_usdt": 1.0,
+    "paper_balance_usdt": 25.0,
+    "balance_refresh_sec": 1.0,
+    "estimated_fee_bps": 0.0,
+    "min_net_edge_bps": 4.0,
+    "min_expected_profit_usdt": 0.02,
+    "max_notional_usdt": null
+  },
+
+  "leverage": {
+    "default": 5.0,
+    "max_configurable": 450.0,
+    "extreme_threshold": 50.0,
+    "allow_extreme": false
+  },
+
+  "rate_limits": {
+    "upstream_hourly_limit": 500,
+    "safety_factor": 0.88,
+    "close_reserve_pct": 0.10,
+    "min_close_reserve_requests": 10,
+    "entry_request_cost": 3,
+    "stop_request_cost": 1,
+    "emergency_close_request_cost": 1
+  },
+
+  "execution": {
+    "order_type": "LIMIT",
+    "limit_offset_bps": 0.5,
+    "fill_timeout_ms": 1500,
+    "cancel_on_partial_after_ms": 2000,
+    "min_notional_usdt": 5.0,
+    "attached_stop_if_supported": false,
+    "protective_stop_timeout_ms": 1000,
+    "latency_edge_buffer_bps": 3.0,
+    "min_entry_side_depth_to_notional": 20.0,
+    "min_best_level_to_notional": 2.0,
+    "max_entry_send_latency_ms": 600.0,
+    "max_entry_total_latency_ms": 1200.0,
+    "latency_pause_sec": 300.0
+  },
+
+  "dashboard": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8765,
+    "exchange_refresh_sec": 30.0
+  },
+
+  "storage": {
+    "sqlite_path": "data/trading_bot.sqlite",
+    "trades_csv": "data/trades/trades.csv",
+    "signals_csv": "data/trades/signals.csv",
+    "errors_log": "data/logs/errors.log",
+    "latency_log": "data/logs/latency.log",
+    "positions_snapshot": "data/trades/positions_snapshot.json"
+  },
+
+  "logging": {
+    "level": "INFO",
+    "json_output": true,
+    "redact_secrets": true
+  }
+}
