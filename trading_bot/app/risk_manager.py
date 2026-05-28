@@ -34,6 +34,9 @@ class _DayStats:
     pnl_usdt: float = 0.0
     trade_count: int = 0
     consecutive_losses: int = 0
+    # Total losing trades today (any negative-PnL close). Used by the
+    # circuit breaker — see RiskManager.register_close.
+    total_losses: int = 0
 
     def maybe_roll(self, now: datetime) -> None:
         today = now.strftime("%Y-%m-%d")
@@ -44,6 +47,7 @@ class _DayStats:
             self.pnl_usdt = 0.0
             self.trade_count = 0
             self.consecutive_losses = 0
+            self.total_losses = 0
 
 
 class RiskManager:
@@ -165,12 +169,25 @@ class RiskManager:
         self._day.pnl_usdt += pnl_usdt
         if pnl_usdt < 0:
             self._day.consecutive_losses += 1
+            self._day.total_losses += 1
             if self._day.consecutive_losses >= self.cfg.max_consecutive_losses:
                 self._paused_until = time.monotonic() + self.cfg.pause_after_consecutive_losses_sec
                 log.warning("risk.paused", losses=self._day.consecutive_losses,
                             for_sec=self.cfg.pause_after_consecutive_losses_sec)
+            # Hard circuit breaker — after N total losses today, kill
+            # trading until a manual restart. Designed to limit a slow
+            # bleed when market conditions don't fit the strategy at all.
+            limit = getattr(self.cfg, "daily_loss_circuit_breaker_count", 0) or 0
+            if limit > 0 and self._day.total_losses >= limit:
+                self._emergency = True
+                log.error("risk.circuit_breaker_tripped",
+                          total_losses=self._day.total_losses,
+                          limit=limit,
+                          day_pnl=self._day.pnl_usdt,
+                          hint="kill switch armed; restart bot to resume")
         else:
             self._day.consecutive_losses = 0
         log.info("risk.day_state",
                  pnl=self._day.pnl_usdt, trades=self._day.trade_count,
-                 losses_streak=self._day.consecutive_losses)
+                 losses_streak=self._day.consecutive_losses,
+                 total_losses=self._day.total_losses)

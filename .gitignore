@@ -27,3 +27,13 @@ data/*.db
 # OS
 Thumbs.db
 .DS_Store
+
+# Debug-session SSH helpers — contain plaintext VPS credentials.
+# NEVER commit. Delete after debug session.
+_ssh_test.py
+_vps.py
+_vps_push.py
+_vps_*.py
+_vps_trades.csv
+_vps_*.csv
+_vps_*.log

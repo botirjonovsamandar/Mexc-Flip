@@ -105,6 +105,18 @@ class TradingBot:
 
         await self._stop.wait()
         log.info("bot.stopping")
+        # Graceful shutdown: cancel all open positions on MEXC before tearing
+        # down. Without this, a SIGINT mid-trade can leave an unfilled order
+        # or an open position the bot never reports — exactly the BCH ghost
+        # we just hit. emergency_close_all is idempotent and rate-limited.
+        if self.cfg.mode in (TradingMode.SMALL_LIVE, TradingMode.LIVE):
+            try:
+                await asyncio.wait_for(
+                    self.execution.emergency_close_all(),
+                    timeout=15.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.error("bot.shutdown_close_failed", err=str(e))
         for t in tasks:
             t.cancel()
         with suppress(asyncio.CancelledError):

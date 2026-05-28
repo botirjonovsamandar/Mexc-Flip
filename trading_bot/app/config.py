@@ -76,6 +76,10 @@ class MarketDataConfig(BaseModel):
 class StrategyConfig(BaseModel):
     impulse_window_ms: int = 500
     min_binance_impulse_bps: float = 6.0
+    # Hard cap to skip "lightning chase" signals — see strategy.evaluate.
+    # Set to None / 0 to disable. 20 bps is a reasonable starting point
+    # given typical MEXC market-maker reaction speed.
+    max_binance_impulse_bps: Optional[float] = 20.0
     min_basis_lag_bps: float = 4.0
     max_mexc_spread_bps: float = 4.0
     min_depth_usdt: float = 5000.0
@@ -100,6 +104,11 @@ class RiskConfig(BaseModel):
     basis_collapse_exit_bps: float = 1.0
     emergency_kill_switch: bool = False
     pause_after_consecutive_losses_sec: int = 900
+    # Hard circuit breaker — when this many losing trades happen in a day,
+    # the kill switch latches and bot stops trading until manually restarted.
+    # Set to 0 to disable. Designed to prevent slow bleed when conditions
+    # don't fit the strategy at all (e.g., fast basis-collapse regime).
+    daily_loss_circuit_breaker_count: int = 10
     # MEXC Contract API allows 20 req / 2 sec = 10/sec on the order path.
     # WS-driven fills (no polling) keep us well below this; raised defaults
     # to avoid throttling real entry/close bursts.

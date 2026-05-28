@@ -152,7 +152,13 @@ class PositionManager:
             log.info("position.breakeven_armed", symbol=pos.symbol, bps=bps,
                      new_stop=pos.stop_price)
 
-        if binance_mid and bps > 0:
+        # Basis collapse: the arb premise (MEXC lagging Binance) is GONE,
+        # so close the trade — no point holding directional risk waiting
+        # for take_profit. The old `bps > 0` precondition was wrong: it
+        # blocked exits when slippage at entry put us slightly negative,
+        # forcing us to wait for take_profit that would never trigger
+        # because the basis movement was already consumed.
+        if binance_mid:
             basis_bps = (mark - binance_mid) / binance_mid * 10_000.0
             if abs(basis_bps) <= self.cfg.basis_collapse_exit_bps:
                 return ExitDecision(True, ExitReason.BASIS_COLLAPSE,

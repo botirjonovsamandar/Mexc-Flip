@@ -187,6 +187,24 @@ class ExecutionEngine:
         # lazily on first use and refreshed when mexc_ticker_map is wired.
         # Avoids re-running _validate_live_ticker on the entry hot path.
         self._entry_template_cache: dict[str, tuple[str, TickerGate]] = {}
+        # Anti-race for close_position: signal_loop fast-path and the periodic
+        # _position_loop can both call close_position with the same symbol
+        # within microseconds of each other. Without this guard, both calls
+        # send a reduce_only MARKET close — on MEXC the second order can
+        # accidentally OPEN a new position in the opposite direction, leaving
+        # an untracked ghost position.
+        self._closing_symbols: set[str] = set()
+        # Per-symbol close-failure counter. When MEXC rejects our close
+        # repeatedly (e.g., because of conflicting reduce_only orders or
+        # stale state we can't see), we'd otherwise spam close requests
+        # forever (~1/sec). After this many consecutive failures we stop
+        # auto-closing, flag the symbol for manual intervention, and let
+        # the user fix the state via UI.
+        self._close_failure_counts: dict[str, int] = {}
+        self._close_failure_limit = 5
+        # Symbols that hit the failure limit. Bot won't auto-close these
+        # until reconciliation clears the position (or user restarts).
+        self._abandoned_close_symbols: set[str] = set()
         self._account_snapshot: AccountSnapshot | None = None
         self._exchange_positions: list[dict[str, Any]] = []
         self._last_exchange_positions_refresh: float = 0.0
@@ -278,9 +296,15 @@ class ExecutionEngine:
     def on_ws_order_update(self, data: dict[str, Any]) -> None:
         """Hook for WS-delivered order_update events.
 
-        Resolves any pending entry future keyed by ClientId/OrderId so
-        _await_fill can complete without REST polling. Polling fallback
-        in _await_fill still runs in case WS misses an event.
+        Resolves any pending entry future. The key wrinkle: MetaScalp's
+        place_order REST response includes ClientId only, but order_update
+        events carry OrderId (exchange-side) without ClientId. So we try
+        several match strategies in order of specificity:
+          1. ClientId / OrderId direct match (works if MetaScalp later
+             populates either field on the event)
+          2. Ticker + Side composite key (registered at place_order time;
+             safe because we run with max_open_positions=1)
+        Polling fallback in _await_fill still runs as a safety net.
         """
         client_id = str(data.get("ClientId") or data.get("clientId") or "")
         order_id = str(data.get("OrderId") or data.get("orderId") or "")
@@ -289,6 +313,16 @@ class ExecutionEngine:
             fut = self._pending_order_futures.get(client_id)
         elif order_id and order_id in self._pending_order_futures:
             fut = self._pending_order_futures.get(order_id)
+        else:
+            # Fall back to (ticker, side) composite key. Side comes back
+            # from MetaScalp as "Buy"/"Sell" text on the WS event.
+            ticker = str(data.get("Ticker") or data.get("ticker") or "")
+            side_text = str(data.get("Side") or data.get("side") or "").lower()
+            if ticker and side_text:
+                side_norm = "BUY" if "buy" in side_text else "SELL" if "sell" in side_text else ""
+                composite = f"{_normalize_symbol(ticker)}:{side_norm}"
+                if composite in self._pending_order_futures:
+                    fut = self._pending_order_futures.get(composite)
         if fut is None or fut.done():
             return
         status = str(data.get("Status") or data.get("status") or "").lower()
@@ -537,6 +571,19 @@ class ExecutionEngine:
 
     async def close_position(self, symbol: str, reason: ExitReason,
                               detail: str = "") -> None:
+        sym_key = symbol.upper()
+        # Drop the call if a close on this symbol is already in flight.
+        # Without this guard the signal-loop fast path and the 1s position
+        # fallback could both send reduce_only closes, the second one
+        # accidentally creating a reverse position on MEXC.
+        if sym_key in self._closing_symbols:
+            log.debug("execution.close_already_in_flight", symbol=sym_key)
+            return
+        # If we already hit the failure limit, stop auto-retrying. The
+        # symbol needs manual intervention (or a reconciler clearing the
+        # position from the local tracker).
+        if sym_key in self._abandoned_close_symbols:
+            return
         pos = self.positions.get(symbol)
         if not pos:
             return
@@ -546,22 +593,69 @@ class ExecutionEngine:
             log.warning("execution.close_no_book", symbol=symbol)
             return
 
-        if self.mode in (TradingMode.DRY_RUN, TradingMode.PAPER):
-            ok = True
-        else:
-            ok = await self._live_close(pos)
+        self._closing_symbols.add(sym_key)
+        try:
+            if self.mode in (TradingMode.DRY_RUN, TradingMode.PAPER):
+                ok = True
+            else:
+                # Before retrying after prior failures: clean up any pending
+                # reduce_only orders for this ticker (e.g., a stale STOP_LOSS
+                # whose ack timed out but the order is sitting on MEXC). The
+                # close MARKET reduce_only can be rejected if it conflicts
+                # with another reduce_only order on the same position.
+                if self._close_failure_counts.get(sym_key, 0) > 0:
+                    await self._cleanup_pending_reduce_orders(pos)
+                ok = await self._live_close(pos)
 
-        if not ok:
-            log.error("execution.close_failed", symbol=symbol)
-            return
+            if not ok:
+                attempts = self._close_failure_counts.get(sym_key, 0) + 1
+                self._close_failure_counts[sym_key] = attempts
+                log.error("execution.close_failed", symbol=symbol,
+                          attempts=attempts, limit=self._close_failure_limit,
+                          reason=reason.value)
+                # Reconcile: maybe the position was already closed on MEXC
+                # but our close request failed for an unrelated reason
+                # (timeout, conflict with stale stop). Check positions.
+                actual = await self._lookup_live_position_fill(symbol, pos.side)
+                if actual is None or actual.qty <= 0:
+                    # Position is already gone on the exchange — drop it from
+                    # the local tracker. Note: we don't know exact exit price,
+                    # so use the current best mid as a proxy for accounting.
+                    log.warning("execution.close_reconciled_already_gone",
+                                symbol=symbol, attempts=attempts,
+                                hint="position not on MEXC; clearing local state")
+                    pnl = (exit_price - pos.entry_price) * pos.qty
+                    if pos.side is Side.SHORT:
+                        pnl = -pnl
+                    self.positions.close(symbol)
+                    self._account_snapshot = None
+                    self.risk.register_close(pnl)
+                    self._log_close_trade(pos, exit_price, pnl, reason,
+                                          f"{detail}|reconciled_manual_close")
+                    self._close_failure_counts.pop(sym_key, None)
+                    self._abandoned_close_symbols.discard(sym_key)
+                    return
+                if attempts >= self._close_failure_limit:
+                    self._abandoned_close_symbols.add(sym_key)
+                    self.risk.block_entries(f"close_abandoned:{symbol}")
+                    log.error("execution.close_abandoned",
+                              symbol=symbol, attempts=attempts,
+                              hint="manual intervention needed via MEXC UI; "
+                                   "bot will stop auto-closing this symbol")
+                return
 
-        pnl = (exit_price - pos.entry_price) * pos.qty
-        if pos.side is Side.SHORT:
-            pnl = -pnl
-        self.positions.close(symbol)
-        self._account_snapshot = None
-        self.risk.register_close(pnl)
-        self._log_close_trade(pos, exit_price, pnl, reason, detail)
+            pnl = (exit_price - pos.entry_price) * pos.qty
+            if pos.side is Side.SHORT:
+                pnl = -pnl
+            self.positions.close(symbol)
+            self._account_snapshot = None
+            self.risk.register_close(pnl)
+            self._log_close_trade(pos, exit_price, pnl, reason, detail)
+            # On success, clear any prior failure bookkeeping.
+            self._close_failure_counts.pop(sym_key, None)
+            self._abandoned_close_symbols.discard(sym_key)
+        finally:
+            self._closing_symbols.discard(sym_key)
 
     async def emergency_close_all(self) -> None:
         log.error("execution.emergency_close_all", count=self.positions.count)
@@ -675,22 +769,49 @@ class ExecutionEngine:
         self._exchange_positions = parsed
         return self.exchange_positions_snapshot()
 
-    async def _lookup_live_position_fill(self, symbol: str,
-                                         side: Side) -> LivePositionInfo | None:
+    async def _lookup_live_position_fill(
+        self, symbol: str, side: Side, *,
+        retries: int = 1, retry_delay_sec: float = 0.5,
+    ) -> LivePositionInfo | None:
+        """Look up a live position on MEXC, with optional retries.
+
+        Used as the recovery path when place_order errors out (timeout) but
+        the order may actually have filled on MEXC. A single failed REST
+        query isn't conclusive — the ORDER might have reached MEXC even if
+        our get_positions call timed out moments later. We retry up to N
+        times before giving up, so a transient API hiccup doesn't orphan
+        a real open position.
+        """
         if self.metascalp is None or self.mexc_connection_id is None:
             return None
-        if not self.rate_limiter.acquire("reconcile"):
-            return None
-        try:
-            raw_positions = await self.metascalp.get_positions(self.mexc_connection_id)
-        except Exception as e:  # noqa: BLE001
-            log.warning("execution.position_lookup_failed", symbol=symbol, err=str(e))
-            return None
-        for raw in raw_positions:
-            info = self._parse_live_position(raw)
-            if info and info.symbol == symbol.upper() and info.side is side and info.qty > 0:
-                await self.refresh_exchange_positions(force=True)
-                return info
+        attempts = max(1, retries)
+        last_err = ""
+        for attempt in range(attempts):
+            if not self.rate_limiter.acquire("reconcile"):
+                if attempt < attempts - 1:
+                    await asyncio.sleep(retry_delay_sec)
+                continue
+            try:
+                raw_positions = await self.metascalp.get_positions(
+                    self.mexc_connection_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                log.warning("execution.position_lookup_failed",
+                            symbol=symbol, attempt=attempt + 1,
+                            attempts=attempts, err=last_err)
+                if attempt < attempts - 1:
+                    await asyncio.sleep(retry_delay_sec)
+                continue
+            for raw in raw_positions:
+                info = self._parse_live_position(raw)
+                if info and info.symbol == symbol.upper() and info.side is side and info.qty > 0:
+                    await self.refresh_exchange_positions(force=True)
+                    return info
+            # Position not found on this attempt — could be the order
+            # hadn't filled yet, retry after a short delay.
+            if attempt < attempts - 1:
+                await asyncio.sleep(retry_delay_sec)
         await self.refresh_exchange_positions(force=True)
         return None
 
@@ -870,11 +991,12 @@ class ExecutionEngine:
         return max(0.0, self._entry_latency_block_until - time.monotonic())
 
     def _entry_latency_too_high(self, fill: FillResult) -> bool:
-        total_ms = fill.latency_send_ms + fill.latency_fill_ms
-        return (
-            fill.latency_send_ms > self.exec_cfg.max_entry_send_latency_ms
-            or total_ms > self.exec_cfg.max_entry_total_latency_ms
-        )
+        # Only the network/send leg counts as "latency".
+        # fill_ms is market wait time for a LIMIT order to be matched —
+        # that's not network latency and can legitimately be several
+        # seconds during quiet liquidity periods. Closing on slow fills
+        # was triggering emergency exits on profitable trades.
+        return fill.latency_send_ms > self.exec_cfg.max_entry_send_latency_ms
 
     def _arm_entry_latency_guard(self, fill: FillResult) -> None:
         total_ms = fill.latency_send_ms + fill.latency_fill_ms
@@ -1085,7 +1207,12 @@ class ExecutionEngine:
                                      size=qty, price=limit_price,
                                      status="rejected",
                                      detail=str(e)[:180])
-            live_fill = await self._lookup_live_position_fill(symbol, side)
+            # place_order errored — the order may still have reached MEXC.
+            # Retry the position lookup several times before declaring
+            # "no fill". Otherwise we orphan a real position we never see.
+            live_fill = await self._lookup_live_position_fill(
+                symbol, side, retries=4, retry_delay_sec=0.5,
+            )
             if live_fill is not None:
                 fill_price = live_fill.entry_price or mark
                 self._record_order_event(symbol=symbol, ticker=mexc_ticker,
@@ -1138,13 +1265,16 @@ class ExecutionEngine:
                         or resp.get("orderId") or resp.get("clientId") or "")
         client_id = str(resp.get("ClientId") or resp.get("clientId") or "")
 
-        # Register a Future under BOTH ids (whichever the WS event references).
-        # The on_ws_order_update hook resolves the Future as soon as MetaScalp
-        # pushes a terminal status — eliminating the 150ms polling cadence.
+        # Register a Future under several keys — whichever the WS event
+        # carries first wins. MetaScalp's order_update events typically have
+        # only OrderId+Ticker+Side (no ClientId), so we also map by composite
+        # ticker:side key (safe with max_open_positions=1).
         loop = asyncio.get_event_loop()
         fut: asyncio.Future[dict[str, Any]] = loop.create_future()
         future_keys: list[str] = []
-        for key in (client_id, order_id):
+        side_text = "BUY" if side is Side.LONG else "SELL"
+        composite = f"{symbol.upper()}:{side_text}"
+        for key in (client_id, order_id, composite):
             if key and key not in self._pending_order_futures:
                 self._pending_order_futures[key] = fut
                 future_keys.append(key)
@@ -1161,7 +1291,11 @@ class ExecutionEngine:
         fill_ms = (time.monotonic() - t_send) * 1000 - send_ms
 
         if not filled or fill_price is None:
-            live_fill = await self._lookup_live_position_fill(symbol, side)
+            # fill_timeout — retry several lookups before giving up,
+            # the position might be live on MEXC even if our polling missed it.
+            live_fill = await self._lookup_live_position_fill(
+                symbol, side, retries=3, retry_delay_sec=0.5,
+            )
             if live_fill is not None:
                 log.warning("execution.fill_detected_from_positions",
                             symbol=symbol, qty=live_fill.qty,
@@ -1203,7 +1337,11 @@ class ExecutionEngine:
                                              detail="fill_timeout")
                 except Exception as e:  # noqa: BLE001
                     log.warning("execution.cancel_after_timeout_failed", err=str(e))
-            live_fill = await self._lookup_live_position_fill(symbol, side)
+            # Last-chance lookup AFTER cancel — order might have filled in
+            # the brief window between fill_timeout and cancel.
+            live_fill = await self._lookup_live_position_fill(
+                symbol, side, retries=3, retry_delay_sec=0.5,
+            )
             if live_fill is not None:
                 fill_price = live_fill.entry_price or mark
                 filled_qty = live_fill.qty
@@ -1222,6 +1360,32 @@ class ExecutionEngine:
         slip_bps = abs(fill_price - mark) / mark * 10_000.0 if mark > 0 else 0.0
         return FillResult(True, fill_price, filled_qty, order_id,
                           send_ms, fill_ms, slip_bps, "live")
+
+    async def _cleanup_pending_reduce_orders(self, pos: Position) -> None:
+        """Cancel any pending reduce_only orders for the position's ticker.
+
+        Used when retrying a failed close. The original close may have failed
+        because a stale STOP_LOSS reduce_only order is still on the book
+        (e.g., placement ack timed out but the order made it to MEXC). When
+        we then send a MARKET reduce_only, MEXC rejects because there's
+        already a reduce order against the same position size.
+
+        cancel_all is a soft request — if nothing matches it's a no-op.
+        """
+        if self.metascalp is None or self.mexc_connection_id is None:
+            return
+        ticker = self._mexc_ticker(pos.symbol)
+        if not self.rate_limiter.acquire("protective"):
+            log.warning("execution.close_cleanup_rate_limited", symbol=pos.symbol)
+            return
+        try:
+            await self.metascalp.cancel_all(self.mexc_connection_id, ticker=ticker)
+            log.info("execution.close_cleanup_sent",
+                     symbol=pos.symbol, ticker=ticker,
+                     hint="cancelled pending reduce_only orders before retry")
+        except Exception as e:  # noqa: BLE001
+            log.warning("execution.close_cleanup_failed",
+                        symbol=pos.symbol, err=str(e)[:200])
 
     async def _live_close(self, pos: Position) -> bool:
         assert self.metascalp is not None
@@ -1316,7 +1480,10 @@ class ExecutionEngine:
         deadline = time.monotonic() + timeout_ms / 1000.0
         last_filled_qty = 0.0
         last_price: float | None = None
-        poll_interval = 0.5  # was 0.15 — WS-driven now, poll is fallback only
+        # Tightened to 250ms — polling now actually matches orders (was bugged
+        # by ClientId vs OrderId mismatch), so this is the active fast-path
+        # while WS event matching is still being debugged.
+        poll_interval = 0.25
 
         def _parse_ws_payload(data: dict[str, Any]) -> tuple[float | None, float, str]:
             status = str(data.get("Status") or data.get("status") or "").lower()
@@ -1353,11 +1520,35 @@ class ExecutionEngine:
                     if status in ("cancelled", "canceled", "rejected", "expired"):
                         return last_price, last_filled_qty, last_filled_qty > 0
 
-            # Fallback poll. Only acquires budget if WS path didn't resolve.
+            # Fallback poll — check BOTH endpoints because:
+            #  - get_orders only lists OPEN orders (filled MARKET orders are
+            #    already gone before we can poll)
+            #  - get_positions shows the position after a MARKET fill, but
+            #    LIMIT orders sitting on the book don't appear there yet
+            # Trying both covers MARKET-instant-fill AND LIMIT-on-book paths.
             if ws_future is None or not ws_future.done():
                 if not self.rate_limiter.acquire("entry"):
                     await asyncio.sleep(poll_interval)
                     continue
+
+                # 1) Quick check via positions (works for MARKET fills).
+                try:
+                    raw_positions = await self.metascalp.get_positions(
+                        self.mexc_connection_id,
+                    )
+                    canonical = _normalize_symbol(ticker)
+                    for raw in raw_positions:
+                        info = self._parse_live_position(raw)
+                        if info is None or info.symbol != canonical or info.qty <= 0:
+                            continue
+                        last_filled_qty = info.qty
+                        if info.entry_price is not None:
+                            last_price = info.entry_price
+                        return last_price, last_filled_qty, True
+                except Exception:  # noqa: BLE001
+                    pass  # falls through to get_orders below
+
+                # 2) Check open orders (works for LIMIT on book, partial fills).
                 try:
                     orders = await self.metascalp.get_orders(
                         self.mexc_connection_id, ticker=ticker,
@@ -1366,9 +1557,12 @@ class ExecutionEngine:
                     await asyncio.sleep(poll_interval)
                     continue
                 for o in orders:
-                    oid = str(o.get("OrderId") or o.get("ClientId")
-                              or o.get("orderId") or o.get("clientId") or "")
-                    if order_id and oid != order_id:
+                    # Match against both exchange OrderId and MetaScalp's ClientId
+                    # (place_order only returns ClientId, but get_orders can show
+                    # either, depending on exchange).
+                    oid_ex = str(o.get("OrderId") or o.get("orderId") or "")
+                    oid_client = str(o.get("ClientId") or o.get("clientId") or "")
+                    if order_id and order_id not in (oid_ex, oid_client):
                         continue
                     status = str(o.get("Status") or o.get("status") or "").upper()
                     fq = (o.get("FilledSize") or o.get("filledSize")

@@ -121,7 +121,15 @@ class Strategy:
 
         side: Side | None = None
         impulse = snap.binance_impulse_bps
-        if impulse >= self.cfg.min_binance_impulse_bps:
+        # Hard ceiling on impulse — moves above ~20 bps are usually past their
+        # peak by the time we react. MEXC market makers have already adjusted
+        # quotes, leaving little real basis edge, AND the underlying has
+        # higher reversal risk. Better to skip lightning chases and stick to
+        # mid-sized signals that survive entry slippage.
+        max_imp = getattr(self.cfg, "max_binance_impulse_bps", None)
+        if max_imp is not None and max_imp > 0 and abs(impulse) >= max_imp:
+            rejects.append(f"impulse_too_large:{impulse:.2f}>={max_imp}")
+        elif impulse >= self.cfg.min_binance_impulse_bps:
             side = Side.LONG
         elif impulse <= -self.cfg.min_binance_impulse_bps:
             side = Side.SHORT
