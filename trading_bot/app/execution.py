@@ -102,6 +102,19 @@ class TickerGate:
     reason: str = "ok"
 
 
+class _LookupUncertain:
+    """Sentinel: position lookup couldn't complete (rate-limited / error).
+
+    Distinct from None (which means "we successfully checked and there's
+    no matching position"). Callers must NOT clear local state on
+    uncertain — the position may well still be live on the exchange.
+    """
+    INSTANCE: "_LookupUncertain"
+
+
+_LookupUncertain.INSTANCE = _LookupUncertain.__new__(_LookupUncertain)
+
+
 @dataclass(frozen=True)
 class TickerRules:
     price_increment: float | None = None
@@ -637,11 +650,22 @@ class ExecutionEngine:
                 # Reconcile: maybe the position was already closed on MEXC
                 # but our close request failed for an unrelated reason
                 # (timeout, conflict with stale stop). Check positions.
-                actual = await self._lookup_live_position_fill(symbol, pos.side)
+                # IMPORTANT: distinguish "confirmed gone" from "couldn't
+                # check" — if rate-limited, we keep the position in tracker
+                # and retry next tick instead of orphaning a real open
+                # position by clearing local state.
+                actual = await self._lookup_live_position_fill(
+                    symbol, pos.side, retries=2, retry_delay_sec=0.5,
+                )
+                if isinstance(actual, _LookupUncertain):
+                    log.warning("execution.close_reconcile_uncertain",
+                                symbol=symbol, attempts=attempts,
+                                hint="can't verify exchange state; "
+                                     "keeping position in tracker, retry next tick")
+                    return
                 if actual is None or actual.qty <= 0:
-                    # Position is already gone on the exchange — drop it from
-                    # the local tracker. Note: we don't know exact exit price,
-                    # so use the current best mid as a proxy for accounting.
+                    # Position is genuinely gone on the exchange — drop it
+                    # from the local tracker.
                     log.warning("execution.close_reconciled_already_gone",
                                 symbol=symbol, attempts=attempts,
                                 hint="position not on MEXC; clearing local state")
@@ -793,19 +817,27 @@ class ExecutionEngine:
     async def _lookup_live_position_fill(
         self, symbol: str, side: Side, *,
         retries: int = 1, retry_delay_sec: float = 0.5,
-    ) -> LivePositionInfo | None:
+    ) -> "LivePositionInfo | None | _LookupUncertain":
         """Look up a live position on MEXC, with optional retries.
 
-        Used as the recovery path when place_order errors out (timeout) but
-        the order may actually have filled on MEXC. A single failed REST
-        query isn't conclusive — the ORDER might have reached MEXC even if
-        our get_positions call timed out moments later. We retry up to N
-        times before giving up, so a transient API hiccup doesn't orphan
-        a real open position.
+        Returns:
+          - LivePositionInfo  — position found on the exchange
+          - None              — confirmed no matching position (at least one
+                                successful query returned no match)
+          - _LookupUncertain  — ALL queries failed (rate-limited, timeout,
+                                error). Caller MUST NOT treat this as
+                                "no position" — the position may still be
+                                live and the caller should keep monitoring.
+
+        The third state matters because callers used to interpret `None`
+        as "definitely gone" and clear local state, which orphaned real
+        open positions when the rate limiter or MEXC API blocked our
+        reconcile query.
         """
         if self.metascalp is None or self.mexc_connection_id is None:
             return None
         attempts = max(1, retries)
+        any_query_succeeded = False
         last_err = ""
         for attempt in range(attempts):
             if not self.rate_limiter.acquire("reconcile"):
@@ -824,6 +856,7 @@ class ExecutionEngine:
                 if attempt < attempts - 1:
                     await asyncio.sleep(retry_delay_sec)
                 continue
+            any_query_succeeded = True
             for raw in raw_positions:
                 info = self._parse_live_position(raw)
                 if info and info.symbol == symbol.upper() and info.side is side and info.qty > 0:
@@ -833,6 +866,13 @@ class ExecutionEngine:
             # hadn't filled yet, retry after a short delay.
             if attempt < attempts - 1:
                 await asyncio.sleep(retry_delay_sec)
+        if not any_query_succeeded:
+            # Every attempt failed (rate-limit / network / timeout). We
+            # can't conclude the position is gone — surface as uncertain.
+            log.warning("execution.position_lookup_uncertain",
+                        symbol=symbol, attempts=attempts,
+                        hint="couldn't verify exchange state; treating as live")
+            return _LookupUncertain.INSTANCE
         await self.refresh_exchange_positions(force=True)
         return None
 
@@ -1234,6 +1274,11 @@ class ExecutionEngine:
             live_fill = await self._lookup_live_position_fill(
                 symbol, side, retries=4, retry_delay_sec=0.5,
             )
+            if isinstance(live_fill, _LookupUncertain):
+                log.warning("execution.place_error_reconcile_uncertain",
+                            symbol=symbol,
+                            hint="cannot verify if order filled; treating as no_fill but position may exist")
+                live_fill = None
             if live_fill is not None:
                 fill_price = live_fill.entry_price or mark
                 self._record_order_event(symbol=symbol, ticker=mexc_ticker,
@@ -1317,6 +1362,11 @@ class ExecutionEngine:
             live_fill = await self._lookup_live_position_fill(
                 symbol, side, retries=3, retry_delay_sec=0.5,
             )
+            if isinstance(live_fill, _LookupUncertain):
+                log.warning("execution.fill_timeout_reconcile_uncertain",
+                            symbol=symbol,
+                            hint="cannot verify fill; will retry on next poll")
+                live_fill = None
             if live_fill is not None:
                 log.warning("execution.fill_detected_from_positions",
                             symbol=symbol, qty=live_fill.qty,
@@ -1363,6 +1413,11 @@ class ExecutionEngine:
             live_fill = await self._lookup_live_position_fill(
                 symbol, side, retries=3, retry_delay_sec=0.5,
             )
+            if isinstance(live_fill, _LookupUncertain):
+                log.warning("execution.post_cancel_reconcile_uncertain",
+                            symbol=symbol,
+                            hint="cannot verify post-cancel state")
+                live_fill = None
             if live_fill is not None:
                 fill_price = live_fill.entry_price or mark
                 filled_qty = live_fill.qty
