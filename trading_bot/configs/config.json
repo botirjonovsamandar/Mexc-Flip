@@ -67,9 +67,9 @@
     "max_trades_per_day": 40,
     "max_consecutive_losses": 3,
     "max_open_positions": 2,
-    "stop_loss_percent": 1.0,
-    "take_profit_bps": 1.5,
-    "breakeven_trigger_bps": 0.5,
+    "stop_loss_percent": 0.15,
+    "take_profit_bps": 4.0,
+    "breakeven_trigger_bps": 2.0,
     "max_slippage_bps": 3.0,
     "max_spread_bps": 5.0,
     "max_position_time_seconds": 15,
@@ -77,8 +77,8 @@
     "emergency_kill_switch": false,
     "pause_after_consecutive_losses_sec": 900,
     "daily_loss_circuit_breaker_count": 10,
-    "max_mexc_requests_per_sec": 3,
-    "max_mexc_requests_per_min": 60
+    "max_mexc_requests_per_sec": 8,
+    "max_mexc_requests_per_min": 120
   },
 
   "capital": {

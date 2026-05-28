@@ -214,7 +214,11 @@ class ExecutionEngine:
         # auto-closing, flag the symbol for manual intervention, and let
         # the user fix the state via UI.
         self._close_failure_counts: dict[str, int] = {}
-        self._close_failure_limit = 5
+        # Was 5; raised to 15 because rate-limited closes used to count as
+        # failures and the bot would abandon a real live position after
+        # 5 quick retries. With tri-state reconcile + higher rate limits,
+        # actual failures are rarer; more retries = fewer orphans.
+        self._close_failure_limit = 15
         # Symbols that hit the failure limit. Bot won't auto-close these
         # until reconciliation clears the position (or user restarts).
         self._abandoned_close_symbols: set[str] = set()
