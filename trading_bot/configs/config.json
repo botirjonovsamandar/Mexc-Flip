@@ -57,7 +57,7 @@
     "min_depth_usdt": 5000.0,
     "btc_eth_filter_enabled": true,
     "btc_eth_filter_threshold_bps": 4.0,
-    "cooldown_per_symbol_sec": 5.0,
+    "cooldown_per_symbol_sec": 30.0,
     "signal_eval_interval_ms": 50
   },
 
@@ -77,8 +77,8 @@
     "emergency_kill_switch": false,
     "pause_after_consecutive_losses_sec": 900,
     "daily_loss_circuit_breaker_count": 10,
-    "max_mexc_requests_per_sec": 15,
-    "max_mexc_requests_per_min": 400
+    "max_mexc_requests_per_sec": 3,
+    "max_mexc_requests_per_min": 60
   },
 
   "capital": {
@@ -106,7 +106,7 @@
   },
 
   "rate_limits": {
-    "upstream_hourly_limit": 5000,
+    "upstream_hourly_limit": 1500,
     "safety_factor": 0.88,
     "close_reserve_pct": 0.10,
     "min_close_reserve_requests": 10,
@@ -128,7 +128,8 @@
     "min_best_level_to_notional": 2.0,
     "max_entry_send_latency_ms": 1500.0,
     "max_entry_total_latency_ms": 3000.0,
-    "latency_pause_sec": 60.0
+    "latency_pause_sec": 60.0,
+    "min_seconds_between_entries": 3.0
   },
 
   "dashboard": {

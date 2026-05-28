@@ -205,6 +205,11 @@ class ExecutionEngine:
         # Symbols that hit the failure limit. Bot won't auto-close these
         # until reconciliation clears the position (or user restarts).
         self._abandoned_close_symbols: set[str] = set()
+        # Global throttle between ANY two entries (not per-symbol). MEXC
+        # bans futures if you hammer them with orders too fast across
+        # symbols — even if per-symbol rate is fine, the aggregate matters.
+        # Tracks the monotonic time of the last attempted entry.
+        self._last_entry_ts: float = 0.0
         self._account_snapshot: AccountSnapshot | None = None
         self._exchange_positions: list[dict[str, Any]] = []
         self._last_exchange_positions_refresh: float = 0.0
@@ -465,6 +470,19 @@ class ExecutionEngine:
                                      status="blocked",
                                      detail="symbol_not_in_allowlist")
             return None
+        # Global throttle between entries — protects against MEXC banning
+        # the account for hammering orders across symbols. Even though each
+        # symbol has its own cooldown, the aggregate rate across all symbols
+        # can still trip MEXC's anti-abuse system.
+        gap = getattr(self.exec_cfg, "min_seconds_between_entries", 0.0) or 0.0
+        if gap > 0:
+            elapsed = time.monotonic() - self._last_entry_ts
+            if elapsed < gap:
+                log.info("execution.global_entry_throttled",
+                         symbol=symbol,
+                         wait_remaining_sec=round(gap - elapsed, 2),
+                         min_gap_sec=gap)
+                return None
         if symbol.upper() in self._pending_entries:
             log.info("execution.skip_pending_symbol", symbol=symbol)
             return None
@@ -531,6 +549,9 @@ class ExecutionEngine:
                 return None
         finally:
             self._pending_entries.pop(symbol.upper(), None)
+            # Mark the global throttle regardless of fill outcome — even a
+            # failed attempt sent at least one place_order REST call to MEXC.
+            self._last_entry_ts = time.monotonic()
 
         if not fill.ok or fill.price is None:
             log.info("execution.no_fill", symbol=symbol, reason=fill.reason)

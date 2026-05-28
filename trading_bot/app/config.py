@@ -203,6 +203,10 @@ class ExecutionConfig(BaseModel):
     max_entry_send_latency_ms: float = 600.0
     max_entry_total_latency_ms: float = 1200.0
     latency_pause_sec: float = 300.0
+    # Minimum gap between ANY two entry attempts (cross-symbol throttle).
+    # MEXC bans futures access if you hammer order endpoints across many
+    # symbols too fast, even if each symbol's own rate is fine.
+    min_seconds_between_entries: float = 3.0
 
 
 class DashboardConfig(BaseModel):
