@@ -222,6 +222,11 @@ class ExecutionEngine:
         # Symbols that hit the failure limit. Bot won't auto-close these
         # until reconciliation clears the position (or user restarts).
         self._abandoned_close_symbols: set[str] = set()
+        # Orphan reconcile: symbol -> monotonic time we first saw an untracked
+        # exchange position for it. Used to enforce a grace window before we
+        # auto-close, so we never race an in-flight entry/close that simply
+        # hasn't registered in the local tracker yet.
+        self._orphan_seen: dict[str, float] = {}
         # Global throttle between ANY two entries (not per-symbol). MEXC
         # bans futures if you hammer them with orders too fast across
         # symbols — even if per-symbol rate is fine, the aggregate matters.
@@ -644,6 +649,18 @@ class ExecutionEngine:
                 if self._close_failure_counts.get(sym_key, 0) > 0:
                     await self._cleanup_pending_reduce_orders(pos)
                 ok = await self._live_close(pos)
+                # Confirm the close actually flattened the position before we
+                # trust it. `_live_close` returning True only means MetaScalp
+                # ACCEPTED the reduce_only order — a reject/partial would
+                # otherwise clear local state and orphan a still-live position.
+                # If it's still definitively live, flip to the not-ok path so we
+                # retry next tick instead of losing track of it.
+                if ok and not await self._confirm_close(pos):
+                    ok = False
+                    log.warning("execution.close_unconfirmed_still_open",
+                                symbol=symbol,
+                                hint="close accepted but position still live on "
+                                     "MEXC; will retry")
 
             if not ok:
                 attempts = self._close_failure_counts.get(sym_key, 0) + 1
@@ -920,6 +937,138 @@ class ExecutionEngine:
                                      detail=str(e)[:180])
             return False
 
+    async def _confirm_close(self, pos: Position) -> bool:
+        """Verify a just-sent close actually flattened the position.
+
+        Returns:
+          * True  — confirmed flat, OR we couldn't verify (rate-limited / API
+                    error). In the unverifiable case we trust the accepted
+                    order rather than spin; the periodic orphan reconcile is the
+                    backstop.
+          * False — the position is still DEFINITIVELY live across every
+                    successful query, so the caller should retry the close.
+
+        Unlike `_lookup_live_position_fill` (which returns on the first sighting
+        — it's hunting for a fill), this hunts for ABSENCE: it re-checks with a
+        short settle delay so a position that merely lingers one poll after a
+        MARKET fill isn't mistaken for a failed close.
+        """
+        if self.metascalp is None or self.mexc_connection_id is None:
+            return True
+        attempts = 2
+        any_query_succeeded = False
+        for attempt in range(attempts):
+            if not self.rate_limiter.acquire("reconcile"):
+                if attempt < attempts - 1:
+                    await asyncio.sleep(0.3)
+                continue
+            try:
+                raw_positions = await self.metascalp.get_positions(
+                    self.mexc_connection_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("execution.close_confirm_failed", symbol=pos.symbol,
+                            attempt=attempt + 1, err=str(e))
+                if attempt < attempts - 1:
+                    await asyncio.sleep(0.3)
+                continue
+            any_query_succeeded = True
+            still_live = False
+            for raw in raw_positions:
+                info = self._parse_live_position(raw)
+                if (info and info.symbol == pos.symbol.upper()
+                        and info.side is pos.side and info.qty > 0):
+                    still_live = True
+                    break
+            if not still_live:
+                return True  # confirmed flat
+            if attempt < attempts - 1:
+                await asyncio.sleep(0.3)  # let the MARKET fill settle, re-check
+        if not any_query_succeeded:
+            return True  # unverifiable -> trust the accepted close
+        return False  # every successful query still showed the position
+
+    async def reconcile_orphans(self) -> int:
+        """Auto-close exchange positions on allowed symbols the bot isn't tracking.
+
+        'Orphans' (ghosts) appear when a close ack is lost, the bot restarts on
+        top of a live position, or a fill lands we never registered. Left alone
+        they bleed PnL and silently occupy entry slots.
+
+        Safety rails:
+          * live modes only; never touches DRY_RUN / PAPER.
+          * allowlist only — unrelated manual positions are left untouched.
+          * skips symbols we track locally, are actively closing, or have a
+            pending entry for.
+          * grace delay — an orphan must persist across passes for at least
+            `orphan_grace_sec` before we close it, so we never race an in-flight
+            entry/close that simply hasn't registered locally yet.
+
+        Returns the number of orphan closes sent.
+        """
+        if self.mode not in (TradingMode.SMALL_LIVE, TradingMode.LIVE):
+            return 0
+        if self.metascalp is None or self.mexc_connection_id is None:
+            return 0
+        if not getattr(self.exec_cfg, "auto_close_orphans", True):
+            return 0
+        positions = await self.refresh_exchange_positions(force=True)
+        now = time.monotonic()
+        grace = max(0.0, getattr(self.exec_cfg, "orphan_grace_sec", 3.0))
+        live_orphans: set[str] = set()
+        closed = 0
+        for raw_pos in list(positions):
+            symbol = str(raw_pos.get("symbol") or "").upper()
+            if symbol not in self.allowed_symbols:
+                continue
+            try:
+                qty = float(raw_pos.get("qty") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            # Skip anything we already know about or are acting on.
+            if (self.positions.get(symbol) is not None
+                    or symbol in self._closing_symbols
+                    or symbol in self._pending_entries):
+                continue
+            live_orphans.add(symbol)
+            first_seen = self._orphan_seen.get(symbol)
+            if first_seen is None:
+                self._orphan_seen[symbol] = now
+                log.warning("execution.orphan_detected", symbol=symbol, qty=qty,
+                            grace_sec=grace,
+                            hint="untracked exchange position; will auto-close "
+                                 "if it persists past the grace window")
+                continue
+            if now - first_seen < grace:
+                continue
+            side_text = str(raw_pos.get("side") or "")
+            side = Side.LONG if side_text == Side.LONG.value else Side.SHORT
+            info = LivePositionInfo(
+                symbol=symbol,
+                native_ticker=str(raw_pos.get("native_ticker")
+                                  or self._mexc_ticker(symbol)),
+                side=side,
+                qty=qty,
+                entry_price=raw_pos.get("entry_price"),
+                pnl_usdt=raw_pos.get("pnl_usdt"),
+                raw=raw_pos,
+            )
+            log.error("execution.orphan_auto_close", symbol=symbol,
+                      side=side.value, qty=qty,
+                      age_sec=round(now - first_seen, 1),
+                      hint="flattening untracked position")
+            if await self._live_close_external(info):
+                closed += 1
+        # Forget bookkeeping for orphans no longer present (closed or adopted).
+        for sym in list(self._orphan_seen.keys()):
+            if sym not in live_orphans:
+                self._orphan_seen.pop(sym, None)
+        if closed:
+            await self.refresh_exchange_positions(force=True)
+        return closed
+
     def _parse_live_position(self, raw: dict[str, Any]) -> LivePositionInfo | None:
         if not isinstance(raw, dict):
             return None
@@ -1139,9 +1288,19 @@ class ExecutionEngine:
             return None
         basis = abs(sig.snapshot.basis_bps or 0.0)
         gross_edge_bps = max(0.0, basis - self.risk_cfg.basis_collapse_exit_bps)
+        # Round-trip cost model (0% fees, so this is the whole cost):
+        #   entry  -> a MARKET/aggressive LIMIT crossing, already measured by
+        #             `slippage_bps` (avg fill vs mid = entry half-spread + walk)
+        #   exit   -> a MARKET reduce_only crossing ~half the spread
+        # The old code subtracted the FULL `spread` for the exit leg, which
+        # double-counted the entry half-spread (it's already in slippage_bps)
+        # and made the gate reject genuinely +EV setups. Charge the exit its
+        # true half-spread; `latency_edge_buffer_bps` + `min_net_edge_bps`
+        # carry the safety margin for edge decay in flight.
+        exit_cost_bps = spread * 0.5
         net_edge_bps = (
             gross_edge_bps
-            - spread
+            - exit_cost_bps
             - slippage_bps
             - self.capital_cfg.estimated_fee_bps
             - self.exec_cfg.latency_edge_buffer_bps

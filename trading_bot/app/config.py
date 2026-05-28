@@ -207,6 +207,18 @@ class ExecutionConfig(BaseModel):
     # MEXC bans futures access if you hammer order endpoints across many
     # symbols too fast, even if each symbol's own rate is fine.
     min_seconds_between_entries: float = 3.0
+    # --- orphan / ghost-position reconciliation ------------------------------
+    # Periodically flatten any exchange position on a traded symbol that the
+    # bot is NOT tracking locally (a lost close ack, a restart on top of a
+    # live position, a fill we never registered). Left alone these bleed PnL
+    # and silently occupy slots. Disable only for debugging.
+    auto_close_orphans: bool = True
+    # How long an untracked position must persist (seconds) before we close it
+    # — a grace window so we never race an in-flight entry/close that simply
+    # hasn't registered in the local tracker yet.
+    orphan_grace_sec: float = 3.0
+    # How often the reconcile loop scans for orphans.
+    orphan_reconcile_sec: float = 5.0
 
 
 class DashboardConfig(BaseModel):

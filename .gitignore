@@ -28,6 +28,9 @@ data/*.db
 Thumbs.db
 .DS_Store
 
+# Local launcher scripts — machine-specific paths, keep out of the repo
+_run_bot.bat
+
 # Debug-session SSH helpers — contain plaintext VPS credentials.
 # NEVER commit. Delete after debug session.
 _ssh_test.py

@@ -98,6 +98,7 @@ class TradingBot:
             asyncio.create_task(self._signal_loop(), name="signal_loop"),
             asyncio.create_task(self._position_loop(), name="position_loop"),
             asyncio.create_task(self._health_loop(), name="health_loop"),
+            asyncio.create_task(self._reconcile_loop(), name="reconcile_loop"),
         ]
         if self.cfg.dashboard.enabled:
             tasks.append(asyncio.create_task(self._serve_dashboard(),
@@ -446,6 +447,29 @@ class TradingBot:
                     "ts": now_ms, "kind": "binance_stale",
                     "age_ms": self.dashboard.latency["binance_ms"],
                 })
+
+    async def _reconcile_loop(self) -> None:
+        """Periodically flatten untracked ('orphan') positions on our symbols.
+
+        A ghost can appear if a close ack is lost, the bot restarts on top of a
+        live position, or a fill lands we never registered. Anything on an
+        allowed symbol that the bot isn't tracking is closed after a short
+        grace, so we never race an in-flight entry/close. Live modes only.
+        """
+        interval = max(1.0, getattr(self.cfg.execution, "orphan_reconcile_sec", 5.0))
+        while not self._stop.is_set():
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
+            if self._stop.is_set():
+                break
+            if self.cfg.mode not in (TradingMode.SMALL_LIVE, TradingMode.LIVE):
+                continue
+            try:
+                closed = await self.execution.reconcile_orphans()
+                if closed:
+                    log.warning("reconcile.orphans_closed", count=closed)
+            except Exception as e:  # noqa: BLE001
+                log.exception("reconcile.loop_error", err=str(e))
 
     # ---- helpers ------------------------------------------------------------
 

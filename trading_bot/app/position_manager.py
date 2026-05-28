@@ -126,22 +126,32 @@ class PositionManager:
         if not pos:
             return ExitDecision(False)
         book = self.mexc.book(symbol)
-        mark = book.mid
-        if mark is None:
+        mid = book.mid
+        if mid is None:
             return ExitDecision(False)
+        # Evaluate PnL, take-profit and stops against the price we'd ACTUALLY
+        # realize. The exit is a MARKET reduce_only that crosses the spread: a
+        # LONG sells into the best bid, a SHORT buys the best ask. Using mid
+        # here was optimistic by ~half the spread on EVERY exit — take_profit
+        # fired at mid+tp but the fill came back half-a-spread worse, quietly
+        # turning "+tp" trades into scratches or losers once both the entry
+        # and exit crossings were paid. `entry_price` is already the entry-side
+        # fill, so unrealized_bps(exit_mark) is the true net round-trip in bps
+        # (and with 0% fees, that IS the realized profit).
+        exit_mark = (book.best_bid if pos.side is Side.LONG else book.best_ask) or mid
 
         if pos.age_seconds >= self.cfg.max_position_time_seconds:
             return ExitDecision(True, ExitReason.TIME_STOP, f"age={pos.age_seconds:.1f}s")
 
-        bps = pos.unrealized_bps(mark)
+        bps = pos.unrealized_bps(exit_mark)
 
         if pos.stop_price is not None:
-            if pos.side is Side.LONG and mark <= pos.stop_price:
+            if pos.side is Side.LONG and exit_mark <= pos.stop_price:
                 return ExitDecision(True, ExitReason.STOP_LOSS,
-                                    f"mark={mark} <= stop={pos.stop_price}")
-            if pos.side is Side.SHORT and mark >= pos.stop_price:
+                                    f"mark={exit_mark} <= stop={pos.stop_price}")
+            if pos.side is Side.SHORT and exit_mark >= pos.stop_price:
                 return ExitDecision(True, ExitReason.STOP_LOSS,
-                                    f"mark={mark} >= stop={pos.stop_price}")
+                                    f"mark={exit_mark} >= stop={pos.stop_price}")
 
         if bps >= self.cfg.take_profit_bps:
             return ExitDecision(True, ExitReason.TAKE_PROFIT, f"bps={bps:.2f}")
@@ -158,8 +168,11 @@ class PositionManager:
         # blocked exits when slippage at entry put us slightly negative,
         # forcing us to wait for take_profit that would never trigger
         # because the basis movement was already consumed.
+        # Basis uses the MEXC MID vs the Binance mid — the true fair-value gap
+        # that defines the arb. (Deliberately NOT the spread-crossed exit price,
+        # which would skew the basis by ~half a spread.)
         if binance_mid:
-            basis_bps = (mark - binance_mid) / binance_mid * 10_000.0
+            basis_bps = (mid - binance_mid) / binance_mid * 10_000.0
             if abs(basis_bps) <= self.cfg.basis_collapse_exit_bps:
                 return ExitDecision(True, ExitReason.BASIS_COLLAPSE,
                                     f"basis={basis_bps:.2f}bps bps={bps:.2f}")
